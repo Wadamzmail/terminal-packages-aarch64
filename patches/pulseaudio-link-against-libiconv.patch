@@ -1,13 +1,22 @@
+From 77ab3334239aac8660148c840c982d1df90d7472 Mon Sep 17 00:00:00 2001
+From: Wadamzmail <alksndrmetwakil@gmail.com>
+Date: Thu, 27 Aug 2026 13:57:45 +0200
+Subject: [PATCH] fix: update packages patches
+
+---
+ packages/pulseaudio/build.sh | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
 diff --git a/packages/pulseaudio/build.sh b/packages/pulseaudio/build.sh
-index ce4270f6e6..076cf8e7ad 100644
+index f170936..292a247 100644
 --- a/packages/pulseaudio/build.sh
 +++ b/packages/pulseaudio/build.sh
 @@ -5,7 +5,7 @@ TERMUX_PKG_MAINTAINER="@termux"
  TERMUX_PKG_SRCURL=git+https://github.com/pulseaudio/pulseaudio
  TERMUX_PKG_VERSION="17.0"
- TERMUX_PKG_REVISION=1
--TERMUX_PKG_DEPENDS="dbus, libandroid-execinfo, libandroid-glob, libc++, libltdl, libsndfile, libsoxr, libwebrtc-audio-processing, speexdsp"
-+TERMUX_PKG_DEPENDS="dbus, libandroid-execinfo, libandroid-glob, libc++, libiconv, libltdl, libsndfile, libsoxr, libwebrtc-audio-processing, speexdsp"
+ TERMUX_PKG_REVISION=4
+-TERMUX_PKG_DEPENDS="dbus, libandroid-stub, libandroid-execinfo, libandroid-glob, libc++, libltdl, libsndfile, libsoxr, libwebrtc-audio-processing, speexdsp"
++TERMUX_PKG_DEPENDS="dbus, libandroid-stub, libandroid-execinfo, libandroid-glob, libc++, libiconv, libltdl, libsndfile, libsoxr, libwebrtc-audio-processing, speexdsp"
  TERMUX_PKG_BREAKS="libpulseaudio-dev, libpulseaudio"
  TERMUX_PKG_REPLACES="libpulseaudio-dev, libpulseaudio"
  # glib is only a runtime dependency of pulseaudio-glib subpackage
@@ -15,7 +24,10 @@ index ce4270f6e6..076cf8e7ad 100644
  TERMUX_PKG_CONFFILES="etc/pulse/client.conf etc/pulse/daemon.conf etc/pulse/default.pa etc/pulse/system.pa"
  
  termux_step_pre_configure() {
-+	LDFLAGS+=" -liconv "
++    LDFLAGS+=" -liconv "
  	# Our aaudio sink module needs libaaudio.so from a later android api version:
  	if [ $TERMUX_PKG_API_LEVEL -lt 26 ]; then
  		local _libdir="$TERMUX_PKG_TMPDIR/libaaudio"
+-- 
+2.52.0
+
