@@ -1,0 +1,18 @@
+name: Mirror Repository
+
+on:
+  workflow_dispatch:
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clone source repository
+        run: |
+          git clone --mirror https://github.com/Wadamzmail/terminal-packages.git repo.git
+
+      - name: Push mirror
+        run: |
+          cd repo.git
+          git push --mirror https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/Wadamzmail/terminal-packages-arm.git

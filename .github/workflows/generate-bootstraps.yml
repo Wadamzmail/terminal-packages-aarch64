@@ -1,0 +1,105 @@
+name: Build Bootstraps
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "Target architecture"
+        required: true
+        default: "aarch64"
+        type: choice
+        options:
+          - aarch64
+          - arm          
+
+      release:
+        description: "Release build?"
+        required: true
+        default: "true"
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+
+    container:
+      image: ghcr.io/termux/package-builder:latest
+      options: --privileged --device /dev/fuse       
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Android NDK
+        run: |
+          if [ ! -d /github/home/lib/android-ndk-r29 ]; then
+            curl -L "https://dl.google.com/android/repository/android-ndk-r29-linux.zip" -o /tmp/ndk.zip
+            unzip -q /tmp/ndk.zip -d /github/home/lib/
+          else
+            echo "NDK cached"
+          fi
+
+      - name: Install tools
+        run: |        
+          sudo apt-get install -y bash git curl gnupg zip
+
+      - name: Install bootstrap dependencies
+        run: |
+         sudo apt-get update
+         sudo apt-get install -y \
+         brotli \
+         zip \
+         unzip \
+         xz-utils \
+         llvm \
+         findutils \
+         coreutils   
+
+      - name: Prepare output dir
+        run: |
+         mkdir -p "output/${{ inputs.arch }}"
+
+                
+      - name: Build Bootstrap
+        run: |
+          export COTG_REPO="https://github.com/Wadamzmail/terminal-packages-${{ inputs.arch }}/raw/refs/heads/pages"
+          export COTG_OUTPUT_DIR="$(pwd)/output"
+
+          mkdir -p output
+
+          if [ "${{ inputs.release }}" = "true" ]; then
+            bash ./generate-bootstrap-archive.sh -a "${{ inputs.arch }}" -g -r "$COTG_REPO" "${{ inputs.arch }}"
+          else
+            bash ./generate-bootstrap-archive.sh -a "${{ inputs.arch }}" -r "$COTG_REPO" "${{ inputs.arch }}"
+          fi
+
+      - name: Show output
+        run: |
+          find output -type f | head -50
+
+      - name: Get release date
+        id: date
+        run: echo "date=$(date +'%Y.%-m.%-d')" >> $GITHUB_OUTPUT
+
+      - name: Generate SHA256
+        id: hash
+        run: |
+         cd output
+         sha256sum *.zip *.zip.9 > SHA256SUMS.txt
+         cat SHA256SUMS.txt
+
+      - name: Upload Bootstrap Release
+        uses: softprops/action-gh-release@v2
+        with:
+         tag_name: bootstrap-${{ steps.date.outputs.date }}
+         name: Bootstrap ${{ steps.date.outputs.date }}
+         body_path: output/SHA256SUMS.txt
+         files: |
+          output/*.zip
+          output/*.zip.9
+          output/SHA256SUMS.txt
+         fail_on_unmatched_files: false

@@ -1,0 +1,219 @@
+name: Build Packages
+
+on:
+  workflow_dispatch:
+   inputs:
+      arch:
+        description: "Target architecture"
+        required: true
+        default: "aarch64"
+        type: choice
+        options:
+          - aarch64
+          - arm          
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    container:
+      image: ghcr.io/termux/package-builder:latest
+      options: --privileged --device /dev/fuse
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Cache built packages
+        if: always() 
+        id: cache-packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            /data
+            /github/home/.termux-build
+            output/${{ inputs.arch }}
+          key: termux-build-${{ inputs.arch }}-${{ hashFiles('packages/**') }}
+          restore-keys: |
+            termux-build-${{ inputs.arch }}-
+          save-always: true
+
+      - name: Check cache hit
+        run: |
+          echo "Cache hit: ${{ steps.cache-packages.outputs.cache-hit }}"
+          ls output/${{ inputs.arch }}/ | head -10 || echo "output/${{ inputs.arch }} empty"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Android NDK
+        run: |        
+          if [ ! -d /github/home/lib/android-ndk-r29 ]; then
+            curl -L "https://dl.google.com/android/repository/android-ndk-r29-linux.zip" -o /tmp/ndk.zip
+            unzip -q /tmp/ndk.zip -d /github/home/lib/
+          else
+            echo "NDK cached"
+          fi
+         
+      - name: Build packages
+        run: |
+          export ANDROID_NDK_HOME=/github/home/lib/android-ndk-r29
+          export NDK=/github/home/lib/android-ndk-r29
+          bash -x build.sh -a "${{ inputs.arch }}"
+
+      - name: Delete all caches
+        if: success()
+        run: |
+         curl -L \
+         -X DELETE \
+         -H "Accept: application/vnd.github+json" \
+         -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+         -H "X-GitHub-Api-Version: 2022-11-28" \
+         "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/caches"
+        env:
+         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Save built packages cache 
+        if: success() 
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /data
+            /github/home/.termux-build
+            output/${{ inputs.arch }}
+          key: termux-build-${{ inputs.arch }}-${{ hashFiles('packages/**') }}
+
+      - name: Show build log
+        if: always()
+        run: cat output/arm/build.log || cat output/aarch64/build.log || echo "no log"
+
+      - name: Show configure failure
+        if: failure()
+        run: |
+         echo "=== config.log files ==="
+
+         find /github/home/.termux-build \
+         -path "*/build/config.log" \
+         -type f \
+         -print
+
+         echo "=== compiler failure details ==="
+
+         find /github/home/.termux-build \
+         -path "*/build/config.log" \
+         -type f \
+         -exec grep -l "C compiler cannot create executables" {} \; \
+         | while read -r log; do
+           echo
+           echo "========================================"
+           echo "$log"
+           echo "========================================"
+           grep -A80 -B80 \
+             "C compiler cannot create executables" \
+             "$log" || true
+           done
+      
+      - name: Debug debs location
+        if: always()
+        run: |
+          echo "=== output structure ==="
+          find output -type f | head -50
+          echo "=== all debs ==="
+          find . -name "*.deb" -not -path "./.git/*" | head -20
+
+      - name: Show output structure
+        run: |
+          echo "=== output/ ==="
+          find output -type f | head -30
+          echo "=== termux-packages/output ==="
+          find termux-packages/output -type f -name "*.deb" | head -20 || echo "not found"
+          echo "=== /github/home/.termux-build ==="
+          find /github/home/.termux-build -name "*.deb" | head -20 || echo "not found"
+          
+      - name: Package debs
+        run: |
+          cd output/${{ inputs.arch }}
+          # rename colons first
+          for f in *.deb; do
+            newname=$(echo "$f" | tr ':' 'COLON')
+            [ "$f" != "$newname" ] && mv "$f" "$newname"
+          done
+          zip -0 ../packages-${{ inputs.arch }}.zip *.deb
+
+      - name: Delete release + tag
+        run: |
+         curl -X DELETE \
+         -H "Authorization: Bearer $GITHUB_TOKEN" \
+         -H "Accept: application/vnd.github+json" \
+         https://api.github.com/repos/${GITHUB_REPOSITORY}/git/refs/tags/packages-${{ inputs.arch }} || true
+        env:
+         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: packages-${{ inputs.arch }}
+          name: Packages Build ${{ inputs.arch }}
+          files: output/packages-${{ inputs.arch }}.zip
+          fail_on_unmatched_files: false
+          overwrite_files: true
+          overwrite: true 
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+
+    env:
+      GPG_KEY_ID: B740141714937F5987E2F56AD90D5C7DEC721765
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download from Release
+        run: |
+          mkdir -p output/aarch64 output/arm
+          gh release download packages-${{ inputs.arch }} \
+            --pattern "packages-${{ inputs.arch }}.zip" --dir output/${{ inputs.arch }}        
+          (cd output/${{ inputs.arch }} && unzip -o packages-${{ inputs.arch }}.zip && rm packages-${{ inputs.arch }}.zip)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install tools
+        run: sudo apt-get install -y gnupg curl wget python3
+
+      - name: Generate APT repository
+        run: |
+          export COTG_OUTPUT_DIR="$(pwd)/output"
+          export COTG_REPO_DIR="$(pwd)/output/repo"
+          bash ./generate-apt-repo.sh
+
+      - name: Import GPG key
+        run: |
+          echo "${{ secrets.PACKAGES_GPG_KEY }}" | base64 -d | gpg --batch --import
+
+      - name: Sign repository
+        run: |
+          echo "${{ secrets.PACKAGES_GPG_KEY_PASS }}" | \
+          gpg \
+            --yes \
+            --passphrase-fd 0 \
+            --pinentry-mode loopback \
+            --digest-algo SHA256 \
+            --clearsign \
+            -u "${GPG_KEY_ID}" \
+            -o output/repo/dists/stable/InRelease \
+            output/repo/dists/stable/Release
+
+      - name: Deploy to pages branc h
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: pages
+          publish_dir: output/repo
+          keep_files: false
