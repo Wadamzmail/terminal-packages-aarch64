@@ -1,0 +1,24 @@
+From 43b80fcdf5b6b6b6d2658f44f0b20fd9c8d04ae5 Mon Sep 17 00:00:00 2001
+From: Wadamzmail <alksndrmetwakil@gmail.com>
+Date: Fri, 2 Oct 2026 09:05:46 +0200
+Subject: [PATCH] fix: libandroid-utimes
+
+---
+ packages/libandroid-utimes/build.sh | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/packages/libandroid-utimes/build.sh b/packages/libandroid-utimes/build.sh
+index 3b06f12..f845cf2 100644
+--- a/packages/libandroid-utimes/build.sh
++++ b/packages/libandroid-utimes/build.sh
+@@ -1,6 +1,7 @@
+ TERMUX_PKG_HOMEPAGE=https://github.com/termux/libandroid-utimes
+ TERMUX_PKG_DESCRIPTION="futimes, futimesat and lutimes from bionic"
+ TERMUX_PKG_LICENSE="BSD 2-Clause"
++TERMUX_PKG_LICENSE_FILE="LICENSE.md"
+ TERMUX_PKG_MAINTAINER="@termux"
+ TERMUX_PKG_VERSION=0.4
+ TERMUX_PKG_SRCURL=https://github.com/termux/libandroid-utimes/archive/refs/tags/v${TERMUX_PKG_VERSION}.tar.gz
+-- 
+2.55.0
+
