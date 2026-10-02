@@ -1,0 +1,712 @@
+name: Build Selected Packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: "Packages to build (comma-separated)"
+        required: true
+        type: string
+
+      arch:
+        description: "Target architecture"
+        required: true
+        default: "aarch64"
+        type: choice
+        options:
+          - aarch64
+          - arm
+
+permissions:
+  contents: write
+
+concurrency:
+  group: package-build-${{ inputs.arch }}
+  cancel-in-progress: false
+
+jobs:
+
+  build:
+    name: Build Packages
+    runs-on: ubuntu-latest
+
+    container:
+      image: ghcr.io/termux/package-builder:latest
+      options: --privileged --device /dev/fuse
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Show build configuration
+        run: |
+          echo "========================================"
+          echo "Architecture : ${{ inputs.arch }}"
+          echo "Packages     : ${{ inputs.packages }}"
+          echo "========================================"
+
+      - name: Cache build environment
+        uses: actions/cache@v4
+        with:
+          path: |
+            /data
+            /github/home/.termux-build
+            output/${{ inputs.arch }}
+          key: termux-build-${{ inputs.arch }}-${{ hashFiles('packages/**') }}
+          restore-keys: |
+            termux-build-${{ inputs.arch }}-
+          save-always: true
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Android NDK
+        run: |
+          set -e
+
+          if [ ! -d /github/home/lib/android-ndk-r29 ]; then
+            echo "Downloading Android NDK r29..."
+
+            curl -L \
+              "https://dl.google.com/android/repository/android-ndk-r29-linux.zip" \
+              -o /tmp/ndk.zip
+
+            unzip -q \
+              /tmp/ndk.zip \
+              -d /github/home/lib/
+
+            rm -f /tmp/ndk.zip
+          else
+            echo "Android NDK r29 already exists."
+          fi
+
+      - name: Build selected packages
+        run: |
+          set -e
+
+          export ANDROID_NDK_HOME=/github/home/lib/android-ndk-r29
+          export NDK=/github/home/lib/android-ndk-r29
+
+          mkdir -p "output/${{ inputs.arch }}"
+
+          bash -x buildv2.sh \
+            -a "${{ inputs.arch }}" \
+            "${{ inputs.packages }}"
+
+      - name: Show build result
+        if: always()
+        run: |
+          echo "========================================"
+          echo "Generated packages"
+          echo "========================================"
+
+          find "output/${{ inputs.arch }}" \
+            -maxdepth 1 \
+            -type f \
+            -name "*.deb" \
+            -printf '%f\n' |
+            sort || true
+
+          echo
+          echo "========================================"
+          echo "Build log"
+          echo "========================================"
+
+          cat "output/${{ inputs.arch }}/build.log" || true
+
+      # GitHub artifact handling.
+      # ':' can appear in Debian versions because of the epoch:
+      #
+      #     package_1:2.0_aarch64.deb
+      #
+      # Replace ':' temporarily before uploading the artifact.
+      - name: Prepare packages for artifact
+        run: |
+          set -e
+
+          ARCH="${{ inputs.arch }}"
+          DIR="output/${ARCH}"
+
+          cd "$DIR"
+
+          echo "Preparing package filenames..."
+
+          for f in *.deb; do
+            [ -f "$f" ] || continue
+
+            newname="${f//:/COLON}"
+
+            if [ "$f" != "$newname" ]; then
+              echo "Renaming:"
+              echo "  $f"
+              echo "  -> $newname"
+
+              mv "$f" "$newname"
+            fi
+          done
+
+          echo
+          echo "Final artifact files:"
+
+          find . \
+            -maxdepth 1 \
+            -type f \
+            -name "*.deb" \
+            -printf '%f\n' |
+            sort
+
+      - name: Upload built packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: built-packages-${{ inputs.arch }}
+          path: output/${{ inputs.arch }}/*.deb
+          if-no-files-found: error
+          retention-days: 1
+
+
+  release:
+    name: Create Package Releases
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    env:
+      ARCH: ${{ inputs.arch }}
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download built packages
+        uses: actions/download-artifact@v4
+        with:
+          name: built-packages-${{ inputs.arch }}
+          path: output/${{ inputs.arch }}
+
+      - name: Restore package filenames
+        run: |
+          set -e
+
+          ARCH="${{ inputs.arch }}"
+
+          cd "output/${ARCH}"
+
+          echo "Restoring package filenames..."
+
+          for f in *COLON*.deb; do
+            [ -f "$f" ] || continue
+
+            newname="${f//COLON/:}"
+
+            echo "Restoring:"
+            echo "  $f"
+            echo "  -> $newname"
+
+            mv "$f" "$newname"
+          done
+
+          echo
+          echo "Restored packages:"
+
+          find . \
+            -maxdepth 1 \
+            -type f \
+            -name "*.deb" \
+            -printf '%f\n' |
+            sort
+
+
+      # ------------------------------------------------------------------
+      # Extract package metadata and dependency information.
+      # ------------------------------------------------------------------
+
+      - name: Analyze packages
+        run: |
+          set -e
+
+          ARCH="${{ inputs.arch }}"
+
+          mkdir -p metadata
+
+          python3 <<'PY'
+          import glob
+          import json
+          import os
+          import re
+          import subprocess
+
+          arch = os.environ["ARCH"]
+
+          packages = {}
+
+          def run(*args):
+              return subprocess.check_output(
+                  args,
+                  text=True
+              ).strip()
+
+          def parse_depends(depends):
+              """
+              Convert Debian Depends syntax into structured data.
+
+              Examples:
+
+                  libc++
+                  libc++ (>= 1.0)
+                  foo:any
+                  foo | bar
+                  foo (>= 1.0), bar
+
+              Output:
+
+                  [
+                    [
+                      {
+                        "package": "foo",
+                        "constraint": ">= 1.0"
+                      }
+                    ]
+                  ]
+              """
+
+              if not depends:
+                  return []
+
+              result = []
+
+              for group in depends.split(","):
+                  group = group.strip()
+
+                  if not group:
+                      continue
+
+                  alternatives = []
+
+                  for item in group.split("|"):
+                      item = item.strip()
+
+                      if not item:
+                          continue
+
+                      # Remove architecture qualifier.
+                      item = re.sub(r":(?:any|native)$", "", item)
+
+                      match = re.match(
+                          r"^([A-Za-z0-9][A-Za-z0-9+.-]*)(?:\s+\((.*)\))?$",
+                          item
+                      )
+
+                      if not match:
+                          alternatives.append({
+                              "package": item,
+                              "constraint": None
+                          })
+                          continue
+
+                      package_name = match.group(1)
+                      constraint = match.group(2)
+
+                      alternatives.append({
+                          "package": package_name,
+                          "constraint": constraint
+                      })
+
+                  if alternatives:
+                      result.append(alternatives)
+
+              return result
+
+          for deb in sorted(glob.glob(f"output/{arch}/*.deb")):
+
+              package = run(
+                  "dpkg-deb",
+                  "-f",
+                  deb,
+                  "Package"
+              )
+
+              version = run(
+                  "dpkg-deb",
+                  "-f",
+                  deb,
+                  "Version"
+              )
+
+              package_arch = run(
+                  "dpkg-deb",
+                  "-f",
+                  deb,
+                  "Architecture"
+              )
+
+              try:
+                  depends = run(
+                      "dpkg-deb",
+                      "-f",
+                      deb,
+                      "Depends"
+                  )
+              except subprocess.CalledProcessError:
+                  depends = ""
+
+              filename = os.path.basename(deb)
+
+              # Git tags cannot contain ':'.
+              tag_version = version.replace(":", "_")
+
+              tag = f"{package}-{tag_version}-{arch}"
+
+              packages[package] = {
+                  "package": package,
+                  "version": version,
+                  "architecture": package_arch,
+                  "filename": filename,
+                  "release_tag": tag,
+                  "depends_raw": depends,
+                  "dependencies": parse_depends(depends)
+              }
+
+          result = {
+              "schema": 1,
+              "architecture": arch,
+              "packages": packages
+          }
+
+          with open("metadata/packages.json", "w") as f:
+              json.dump(
+                  result,
+                  f,
+                  indent=2,
+                  sort_keys=True
+              )
+              f.write("\n")
+
+          print(json.dumps(result, indent=2))
+          PY
+
+      - name: Show package metadata
+        run: |
+          cat metadata/packages.json
+
+
+      # ------------------------------------------------------------------
+      # Create one GitHub Release for every .deb.
+      #
+      # First create all releases.
+      # Dependency links are added later after every release exists.
+      # ------------------------------------------------------------------
+
+      - name: Create package releases
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          set -e
+
+          ARCH="${{ inputs.arch }}"
+
+          python3 <<'PY'
+          import json
+          import os
+          import subprocess
+
+          arch = os.environ["ARCH"]
+
+          with open("metadata/packages.json") as f:
+              data = json.load(f)
+
+          for package_name, package in data["packages"].items():
+
+              tag = package["release_tag"]
+              filename = package["filename"]
+              deb = f"output/{arch}/{filename}"
+
+              title = (
+                  f"{package_name} "
+                  f"{package['version']} "
+                  f"({arch})"
+              )
+
+              notes = f"""Package: {package_name}
+          Version: {package['version']}
+          Architecture: {package['architecture']}
+
+          Dependencies are listed below and will be linked after all package releases are created.
+          """
+
+              print()
+              print("========================================")
+              print(f"Creating release: {tag}")
+              print("========================================")
+
+              subprocess.run(
+                  [
+                      "gh",
+                      "release",
+                      "create",
+                      tag,
+                      deb,
+                      "--title",
+                      title,
+                      "--notes",
+                      notes
+                  ],
+                  check=True
+              )
+          PY
+
+
+      # ------------------------------------------------------------------
+      # Resolve dependency links.
+      #
+      # Every dependency that was built in this workflow gets a direct
+      # GitHub Release asset URL.
+      #
+      # If a dependency was NOT built in this workflow, the metadata keeps
+      # it as unresolved. This is intentional: we don't invent a URL.
+      # ------------------------------------------------------------------
+
+      - name: Generate dependency metadata and release notes
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -e
+
+          ARCH="${{ inputs.arch }}"
+
+          mkdir -p final
+
+          python3 <<'PY'
+          import json
+          import os
+          import subprocess
+
+          arch = os.environ["ARCH"]
+          repository = os.environ["GITHUB_REPOSITORY"]
+
+          with open("metadata/packages.json") as f:
+              data = json.load(f)
+
+          packages = data["packages"]
+
+          def asset_url(package):
+              tag = package["release_tag"]
+              filename = package["filename"]
+
+              return (
+                  f"https://github.com/{repository}"
+                  f"/releases/download/{tag}/{filename}"
+              )
+
+          final_packages = {}
+
+          for package_name, package in packages.items():
+
+              dependencies = []
+
+              for group in package["dependencies"]:
+
+                  alternatives = []
+
+                  for dependency in group:
+
+                      dependency_name = dependency["package"]
+
+                      target = packages.get(dependency_name)
+
+                      item = {
+                          "package": dependency_name,
+                          "constraint": dependency["constraint"]
+                      }
+
+                      if target is not None:
+                          item["version"] = target["version"]
+                          item["architecture"] = target["architecture"]
+                          item["release_tag"] = target["release_tag"]
+                          item["url"] = asset_url(target)
+                          item["resolved"] = True
+                      else:
+                          item["resolved"] = False
+
+                      alternatives.append(item)
+
+                  dependencies.append(alternatives)
+
+              final_packages[package_name] = {
+                  "package": package_name,
+                  "version": package["version"],
+                  "architecture": package["architecture"],
+                  "filename": package["filename"],
+                  "release_tag": package["release_tag"],
+                  "url": asset_url(package),
+                  "depends_raw": package["depends_raw"],
+                  "dependencies": dependencies
+              }
+
+          result = {
+              "schema": 1,
+              "repository": repository,
+              "architecture": arch,
+              "packages": final_packages
+          }
+
+          with open("final/packages.json", "w") as f:
+              json.dump(
+                  result,
+                  f,
+                  indent=2,
+                  sort_keys=True
+              )
+              f.write("\n")
+
+          print(json.dumps(result, indent=2))
+
+
+          # --------------------------------------------------------------
+          # Generate and update release notes.
+          # --------------------------------------------------------------
+
+          for package_name, package in final_packages.items():
+
+              lines = []
+
+              lines.append(
+                  f"# {package_name}"
+              )
+
+              lines.append("")
+              lines.append(
+                  f"Version: `{package['version']}`"
+              )
+
+              lines.append(
+                  f"Architecture: `{package['architecture']}`"
+              )
+
+              lines.append("")
+              lines.append(
+                  f"Download: "
+                  f"[{package['filename']}]({package['url']})"
+              )
+
+              lines.append("")
+              lines.append("## Dependencies")
+              lines.append("")
+
+              if not package["dependencies"]:
+                  lines.append("This package has no declared dependencies.")
+              else:
+                  for group in package["dependencies"]:
+
+                      if len(group) > 1:
+                          lines.append(
+                              "- Alternative dependency:"
+                          )
+                      else:
+                          lines.append("- Dependency:")
+
+                      for dependency in group:
+
+                          name = dependency["package"]
+                          constraint = dependency["constraint"]
+
+                          text = f"  - `{name}`"
+
+                          if constraint:
+                              text += f" `{constraint}`"
+
+                          if dependency["resolved"]:
+
+                              text += (
+                                  " — "
+                                  f"[Download .deb]"
+                                  f"({dependency['url']})"
+                              )
+
+                          else:
+                              text += (
+                                  " — "
+                                  "**not built in this workflow run**"
+                              )
+
+                          lines.append(text)
+
+              lines.append("")
+              lines.append("## Raw Depends")
+              lines.append("")
+
+              if package["depends_raw"]:
+                  lines.append("```text")
+                  lines.append(package["depends_raw"])
+                  lines.append("```")
+              else:
+                  lines.append("None")
+
+              notes = "\n".join(lines)
+
+              print()
+              print("========================================")
+              print(f"Updating release: {package['release_tag']}")
+              print("========================================")
+
+              subprocess.run(
+                  [
+                      "gh",
+                      "release",
+                      "edit",
+                      package["release_tag"],
+                      "--title",
+                      (
+                          f"{package_name} "
+                          f"{package['version']} "
+                          f"({package['architecture']})"
+                      ),
+                      "--notes",
+                      notes
+                  ],
+                  check=True
+              )
+          PY
+
+
+      # ------------------------------------------------------------------
+      # Upload the complete dependency metadata.
+      # ------------------------------------------------------------------
+
+      - name: Upload dependency metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-metadata-${{ inputs.arch }}
+          path: final/packages.json
+          retention-days: 30
+
+
+      # ------------------------------------------------------------------
+      # Print final releases.
+      # ------------------------------------------------------------------
+
+      - name: Show releases
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          set -e
+
+          echo "========================================"
+          echo "Created package releases"
+          echo "========================================"
+
+          gh release list \
+            --limit 100
+
+          echo
+          echo "========================================"
+          echo "Generated dependency metadata"
+          echo "========================================"
+
+          cat final/packages.json
