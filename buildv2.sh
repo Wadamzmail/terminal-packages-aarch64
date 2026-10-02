@@ -85,6 +85,8 @@ declare -a PATCHES=(
 
   # Use our keys to install dependencies
   "use-our-keys-to-install-deps.patch"
+
+  "0001-fix-libandroid-utimes.patch"
 )
 
 # ---------------------------------------------------------
