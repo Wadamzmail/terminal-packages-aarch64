@@ -1,4 +1,4 @@
-name: Build Selected Packages
+name: Build Selected Packages v2
 
 on:
   workflow_dispatch:
